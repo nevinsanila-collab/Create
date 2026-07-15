@@ -4,34 +4,31 @@ import requests
 from PIL import Image
 import imagehash
 import io
-import base64
 import uvicorn
-from typing import List, Optional
+from typing import List
 
 app = FastAPI(title="Zero-Cost Image Matcher for n8n")
+
+# Browser-like headers so Facebook CDN doesn't block us
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
 
 class Product(BaseModel):
     sku: str
     image_url: str
 
 class MatchRequest(BaseModel):
-    customer_image_base64: str          # base64 string (n8n downloads from FB CDN)
+    customer_image_url: str
     products: List[Product]
 
-def get_image_hash_from_base64(b64_str: str):
+def get_image_hash(url: str):
     try:
-        img_bytes = base64.b64decode(b64_str)
-        img = Image.open(io.BytesIO(img_bytes))
-        return imagehash.phash(img)
-    except Exception as e:
-        print(f"Error decoding base64 image: {e}")
-        return None
-
-def get_image_hash_from_url(url: str):
-    try:
-        response = requests.get(url, timeout=15)
+        response = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
         response.raise_for_status()
-        img = Image.open(io.BytesIO(response.content))
+        img = Image.open(io.BytesIO(response.content)).convert('RGB')
         return imagehash.phash(img)
     except Exception as e:
         print(f"Error processing image {url}: {e}")
@@ -39,23 +36,17 @@ def get_image_hash_from_url(url: str):
 
 @app.post("/match-image")
 def match_image(req: MatchRequest):
-    """
-    Takes customer image as base64 (downloaded by n8n from FB CDN)
-    and a list of product image URLs (Google Drive).
-    Returns the SKU of the best matching product, or None if no match.
-    """
-    customer_hash = get_image_hash_from_base64(req.customer_image_base64)
+    customer_hash = get_image_hash(req.customer_image_url)
     if not customer_hash:
-        raise HTTPException(status_code=400, detail="Could not process customer image")
+        # Graceful fallback — don't crash, just return no match
+        return {"matched": False, "sku": None, "difference": 999, "note": "Could not download customer image"}
 
     best_match = None
     lowest_diff = float('inf')
-
-    # Threshold: 0 = identical, <10 = very similar, <15 = similar
     THRESHOLD = 15
 
     for product in req.products:
-        prod_hash = get_image_hash_from_url(product.image_url)
+        prod_hash = get_image_hash(product.image_url)
         if prod_hash:
             diff = customer_hash - prod_hash
             if diff < lowest_diff:
